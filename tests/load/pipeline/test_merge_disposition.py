@@ -2680,3 +2680,415 @@ def test_row_filter_clear(
         {"id": 2, "val": "b_final"},
     ]
     assert observed == expected
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, supports_merge=True),
+    ids=lambda x: x.name,
+)
+@pytest.mark.parametrize("merge_strategy", ("delete-insert", "upsert"))
+def test_constant_columns(
+    destination_config: DestinationTestConfiguration,
+    merge_strategy: TLoaderMergeStrategy,
+) -> None:
+    """Test that constant_columns injects literal values into INSERT SELECT."""
+    skip_if_unsupported_merge_strategy(destination_config, merge_strategy)
+    table_name = "test_constant_cols"
+
+    @dlt.resource(
+        name=table_name,
+        write_disposition="merge",
+        primary_key="id",
+        columns={"partition_key": {"data_type": "text"}},
+    )
+    def data_resource(data):
+        yield data
+
+    p = destination_config.setup_pipeline("constant_cols_test", dev_mode=True)
+
+    # initial load with partition_key in the data (simulates prior add_map usage)
+    initial_data = [
+        {"id": 1, "val": "a", "partition_key": "2024-01-15"},
+        {"id": 2, "val": "b", "partition_key": "2024-01-15"},
+        {"id": 3, "val": "c", "partition_key": "2024-01-16"},
+    ]
+    info = p.run(data_resource(initial_data), **destination_config.run_kwargs)
+    assert_load_info(info)
+    assert load_table_counts(p, table_name)[table_name] == 3
+
+    # second load: data does NOT contain partition_key — it's injected via constant_columns
+    data_resource.apply_hints(
+        write_disposition={
+            "disposition": "merge",
+            "strategy": merge_strategy,
+            "row_filter": "partition_key = '2024-01-15'",
+            "constant_columns": {"partition_key": "2024-01-15"},
+        },
+    )
+    update_data = [
+        {"id": 1, "val": "updated_a"},
+        {"id": 4, "val": "new_d"},
+    ]
+    info = p.run(data_resource(update_data), **destination_config.run_kwargs)
+    assert_load_info(info)
+
+    observed = [
+        {"id": row[0], "val": row[1], "partition_key": row[2]}
+        for row in select_data(p, f"SELECT id, val, partition_key FROM {table_name}")
+    ]
+    observed = sorted(observed, key=lambda d: d["id"])
+
+    expected = [
+        {"id": 1, "val": "updated_a", "partition_key": "2024-01-15"},
+        {"id": 2, "val": "b", "partition_key": "2024-01-15"},
+        {"id": 3, "val": "c", "partition_key": "2024-01-16"},
+        {"id": 4, "val": "new_d", "partition_key": "2024-01-15"},
+    ]
+    assert observed == expected
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, supports_merge=True),
+    ids=lambda x: x.name,
+)
+def test_constant_columns_without_row_filter(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """Test constant_columns without row_filter — exercises the MERGE-based upsert path."""
+    table_name = "test_cc_no_rf"
+
+    @dlt.resource(
+        name=table_name,
+        write_disposition="merge",
+        primary_key="id",
+        columns={"partition_key": {"data_type": "text"}},
+    )
+    def data_resource(data):
+        yield data
+
+    p = destination_config.setup_pipeline("cc_no_rf", dev_mode=True)
+
+    initial_data = [
+        {"id": 1, "val": "a", "partition_key": "2024-01-15"},
+        {"id": 2, "val": "b", "partition_key": "2024-01-15"},
+    ]
+    info = p.run(data_resource(initial_data), **destination_config.run_kwargs)
+    assert_load_info(info)
+
+    # upsert with constant_columns but no row_filter (uses MERGE path)
+    data_resource.apply_hints(
+        write_disposition={
+            "disposition": "merge",
+            "strategy": "upsert",
+            "constant_columns": {"partition_key": "2024-01-15"},
+        },
+    )
+    update_data = [
+        {"id": 1, "val": "updated_a"},
+        {"id": 3, "val": "new_c"},
+    ]
+    info = p.run(data_resource(update_data), **destination_config.run_kwargs)
+    assert_load_info(info)
+
+    observed = [
+        {"id": row[0], "val": row[1], "partition_key": row[2]}
+        for row in select_data(p, f"SELECT id, val, partition_key FROM {table_name}")
+    ]
+    observed = sorted(observed, key=lambda d: d["id"])
+
+    expected = [
+        {"id": 1, "val": "updated_a", "partition_key": "2024-01-15"},
+        {"id": 2, "val": "b", "partition_key": "2024-01-15"},
+        {"id": 3, "val": "new_c", "partition_key": "2024-01-15"},
+    ]
+    assert observed == expected
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, supports_merge=True),
+    ids=lambda x: x.name,
+)
+def test_constant_columns_insert_only(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """Test constant_columns with insert-only strategy."""
+    table_name = "test_cc_ins_only"
+
+    @dlt.resource(
+        name=table_name,
+        write_disposition="merge",
+        primary_key="id",
+        columns={"partition_key": {"data_type": "text"}},
+    )
+    def data_resource(data):
+        yield data
+
+    p = destination_config.setup_pipeline("cc_ins_only", dev_mode=True)
+
+    initial_data = [
+        {"id": 1, "val": "a", "partition_key": "2024-01-15"},
+    ]
+    info = p.run(data_resource(initial_data), **destination_config.run_kwargs)
+    assert_load_info(info)
+
+    # insert-only: existing id=1 should NOT be updated, new id=2 should be inserted
+    data_resource.apply_hints(
+        write_disposition={
+            "disposition": "merge",
+            "strategy": "insert-only",
+            "constant_columns": {"partition_key": "2024-01-16"},
+        },
+    )
+    update_data = [
+        {"id": 1, "val": "should_not_overwrite"},
+        {"id": 2, "val": "new_b"},
+    ]
+    info = p.run(data_resource(update_data), **destination_config.run_kwargs)
+    assert_load_info(info)
+
+    observed = [
+        {"id": row[0], "val": row[1], "partition_key": row[2]}
+        for row in select_data(p, f"SELECT id, val, partition_key FROM {table_name}")
+    ]
+    observed = sorted(observed, key=lambda d: d["id"])
+
+    expected = [
+        {"id": 1, "val": "a", "partition_key": "2024-01-15"},
+        {"id": 2, "val": "new_b", "partition_key": "2024-01-16"},
+    ]
+    assert observed == expected
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, supports_merge=True),
+    ids=lambda x: x.name,
+)
+def test_constant_columns_with_hard_delete(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """Test constant_columns + hard_delete with upsert strategy."""
+    table_name = "test_cc_hard_del"
+
+    @dlt.resource(
+        name=table_name,
+        write_disposition="merge",
+        primary_key="id",
+        columns={
+            "partition_key": {"data_type": "text"},
+            "deleted": {"hard_delete": True},
+        },
+    )
+    def data_resource(data):
+        yield data
+
+    p = destination_config.setup_pipeline("cc_hard_del", dev_mode=True)
+
+    initial_data = [
+        {"id": 1, "val": "a", "partition_key": "P1", "deleted": False},
+        {"id": 2, "val": "b", "partition_key": "P1", "deleted": False},
+    ]
+    info = p.run(data_resource(initial_data), **destination_config.run_kwargs)
+    assert_load_info(info)
+    assert load_table_counts(p, table_name)[table_name] == 2
+
+    # hard-delete id=1, update id=2, inject partition_key via constant_columns
+    data_resource.apply_hints(
+        write_disposition={
+            "disposition": "merge",
+            "strategy": "upsert",
+            "row_filter": "partition_key = 'P1'",
+            "constant_columns": {"partition_key": "P1"},
+        },
+    )
+    update_data = [
+        {"id": 1, "deleted": True},
+        {"id": 2, "val": "b_updated", "deleted": False},
+    ]
+    info = p.run(data_resource(update_data), **destination_config.run_kwargs)
+    assert_load_info(info)
+
+    observed = [
+        {"id": row[0], "val": row[1], "partition_key": row[2]}
+        for row in select_data(p, f"SELECT id, val, partition_key FROM {table_name}")
+    ]
+    observed = sorted(observed, key=lambda d: d["id"])
+
+    expected = [
+        {"id": 2, "val": "b_updated", "partition_key": "P1"},
+    ]
+    assert observed == expected
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, supports_merge=True),
+    ids=lambda x: x.name,
+)
+def test_constant_columns_nested_tables(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """Test constant_columns with nested child tables — constants must not leak
+    into child table INSERTs."""
+    p = destination_config.setup_pipeline("cc_nested", dev_mode=True)
+
+    @dlt.resource(
+        table_name="parent",
+        write_disposition="merge",
+        primary_key="id",
+        columns={"part": {"data_type": "text"}},
+    )
+    def r(data):
+        yield data
+
+    # initial load with nested child data
+    initial = [
+        {"id": 1, "part": "A", "child": [{"val": "c1"}]},
+        {"id": 2, "part": "A", "child": [{"val": "c2"}]},
+        {"id": 3, "part": "B", "child": [{"val": "c3"}, {"val": "c4"}]},
+    ]
+    info = p.run(r(initial), **destination_config.run_kwargs)
+    assert_load_info(info)
+    assert load_table_counts(p, "parent")["parent"] == 3
+    assert load_table_counts(p, "parent__child")["parent__child"] == 4
+
+    # merge with constant_columns + row_filter, scoped to partition A
+    r.apply_hints(
+        write_disposition={
+            "disposition": "merge",
+            "row_filter": "part = 'A'",
+            "constant_columns": {"part": "A"},
+        },
+    )
+    update = [
+        {"id": 1, "child": [{"val": "c1_updated"}]},
+    ]
+    info = p.run(r(update), **destination_config.run_kwargs)
+    assert_load_info(info)
+
+    # partition B (id=3) must be untouched
+    assert load_table_counts(p, "parent")["parent"] == 3
+    parent_rows = load_tables_to_dicts(p, "parent", exclude_system_cols=True)["parent"]
+    assert_records_as_set(
+        parent_rows,
+        [
+            {"id": 1, "part": "A"},
+            {"id": 2, "part": "A"},
+            {"id": 3, "part": "B"},
+        ],
+    )
+
+    # child rows: id=1 updated, id=2 unchanged, id=3 (partition B) unchanged
+    assert load_table_counts(p, "parent__child")["parent__child"] == 4
+    child_rows = load_tables_to_dicts(p, "parent__child", exclude_system_cols=True)[
+        "parent__child"
+    ]
+    assert sorted([r["val"] for r in child_rows]) == ["c1_updated", "c2", "c3", "c4"]
+
+
+@pytest.mark.parametrize(
+    "destination_config",
+    destinations_configs(default_sql_configs=True, supports_merge=True),
+    ids=lambda x: x.name,
+)
+def test_constant_columns_clear(
+    destination_config: DestinationTestConfiguration,
+) -> None:
+    """Test that constant_columns can be cleared by passing None."""
+    table_name = "test_cc_clear"
+
+    @dlt.resource(
+        name=table_name,
+        write_disposition="merge",
+        primary_key="id",
+        columns={"part": {"data_type": "text"}},
+    )
+    def data_resource(data):
+        yield data
+
+    p = destination_config.setup_pipeline("cc_clear", dev_mode=True)
+
+    initial = [
+        {"id": 1, "val": "a", "part": "A"},
+        {"id": 2, "val": "b", "part": "B"},
+    ]
+    info = p.run(data_resource(initial), **destination_config.run_kwargs)
+    assert_load_info(info)
+
+    # merge with constant_columns active
+    data_resource.apply_hints(
+        write_disposition={
+            "disposition": "merge",
+            "row_filter": "part = 'A'",
+            "constant_columns": {"part": "A"},
+        },
+    )
+    update1 = [{"id": 1, "val": "a_updated"}]
+    info = p.run(data_resource(update1), **destination_config.run_kwargs)
+    assert_load_info(info)
+
+    # clear constant_columns and row_filter
+    data_resource.apply_hints(
+        write_disposition={
+            "disposition": "merge",
+            "row_filter": None,
+            "constant_columns": None,
+        },
+    )
+    update2 = [
+        {"id": 1, "val": "a_final", "part": "A"},
+        {"id": 2, "val": "b_final", "part": "B"},
+    ]
+    info = p.run(data_resource(update2), **destination_config.run_kwargs)
+    assert_load_info(info)
+
+    observed = [
+        {"id": row[0], "val": row[1]}
+        for row in select_data(p, f"SELECT id, val FROM {table_name}")
+    ]
+    observed = sorted(observed, key=lambda d: d["id"])
+    # both partitions updated — constant_columns was cleared
+    expected = [
+        {"id": 1, "val": "a_final"},
+        {"id": 2, "val": "b_final"},
+    ]
+    assert observed == expected
+
+
+def test_constant_columns_validation() -> None:
+    """Test that constant_columns validates types and column existence."""
+
+    @dlt.resource(
+        name="test_cc_val",
+        write_disposition="merge",
+        primary_key="id",
+        columns={"partition_key": {"data_type": "text"}},
+    )
+    def data_resource():
+        yield {"id": 1}
+
+    def apply_and_resolve(**wd_kwargs):
+        """Apply hints and trigger schema resolution to fire validation."""
+        data_resource.apply_hints(write_disposition=wd_kwargs)
+        data_resource.compute_table_schema()
+
+    # non-dict raises ValueError
+    with pytest.raises(ValueError, match="must be a dict"):
+        apply_and_resolve(disposition="merge", constant_columns="not_a_dict")
+
+    # non-string value raises ValueError
+    with pytest.raises(ValueError, match="must be strings"):
+        apply_and_resolve(disposition="merge", constant_columns={"partition_key": 123})
+
+    # reference to column not in schema raises ValueError
+    with pytest.raises(ValueError, match="not defined in the table schema"):
+        apply_and_resolve(disposition="merge", constant_columns={"nonexistent_col": "value"})
+
+    # valid usage works
+    apply_and_resolve(disposition="merge", constant_columns={"partition_key": "2024-01-15"})
+
+    # clearing with None works
+    apply_and_resolve(disposition="merge", constant_columns=None)

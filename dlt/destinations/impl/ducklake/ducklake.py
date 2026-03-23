@@ -51,7 +51,7 @@ from __future__ import annotations
 import os
 import pathlib
 from packaging.version import Version
-from typing import Any, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import dlt
 from dlt.common import logger
@@ -87,6 +87,7 @@ class DuckLakeMergeFollowupJob(SqlMergeFollowupJob):
         deleted_cond: Optional[str],
         insert_only: bool = False,
         not_deleted_cond: Optional[str] = None,
+        cc_escaped: Optional[Dict[str, str]] = None,
     ) -> List[str]:
         """Generate MERGE statement without DELETE clause + separate DELETE for hard deletes."""
         # insert-only: no DuckLake-specific workaround needed
@@ -100,6 +101,7 @@ class DuckLakeMergeFollowupJob(SqlMergeFollowupJob):
                 deleted_cond,
                 insert_only=True,
                 not_deleted_cond=not_deleted_cond,
+                cc_escaped=cc_escaped,
             )
 
         # upsert: get MERGE without DELETE clause, then add separate DELETE for hard deletes
@@ -110,6 +112,7 @@ class DuckLakeMergeFollowupJob(SqlMergeFollowupJob):
             root_table_column_names,
             hard_delete_col=None,  # No DELETE in MERGE for DuckLake
             deleted_cond=None,
+            cc_escaped=cc_escaped,
         )
 
         if hard_delete_col is not None:

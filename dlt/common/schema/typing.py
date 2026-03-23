@@ -270,6 +270,10 @@ class TMergeDispositionDict(TWriteDispositionDict):
     """Raw SQL WHERE predicate scoping merge operations to a partition of the
     destination table. Injected as-is into generated SQL — the caller is
     responsible for correctness and escaping."""
+    constant_columns: Optional[Dict[str, str]]
+    """Mapping of column name to literal value injected into INSERT SELECT
+    during merge. Values are escaped as SQL literals — they do not need to
+    exist in the staged data."""
 
 
 class TDeleteInsertStrategyDict(TMergeDispositionDict):

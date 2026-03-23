@@ -451,6 +451,12 @@ class SqlMergeFollowupJob(SqlFollowupJob):
         return cast(Optional[str], table.get("x-row-filter"))
 
     @classmethod
+    def _get_constant_columns(
+        cls, table: PreparedTableSchema
+    ) -> Optional[Dict[str, str]]:
+        return cast(Optional[Dict[str, str]], table.get("x-constant-columns"))
+
+    @classmethod
     def get_row_key_col(
         cls,
         table_chain: Sequence[PreparedTableSchema],
@@ -696,6 +702,12 @@ class SqlMergeFollowupJob(SqlFollowupJob):
                 )
                 sql.extend(create_insert_temp_table_sql)
 
+        # constant columns: literal values that replace staging columns in the INSERT
+        constant_cols = cls._get_constant_columns(root_table)
+        cc_escaped: Dict[str, str] = {}
+        if constant_cols:
+            cc_escaped = {escape_column_id(n): escape_lit(v) for n, v in constant_cols.items()}
+
         # insert from staging to dataset
         for table in table_chain:
             table_name, staging_table_name = sql_client.get_qualified_table_names(table["name"])
@@ -709,19 +721,45 @@ class SqlMergeFollowupJob(SqlFollowupJob):
                 uniq_column = root_key_column if is_nested_table(table) else row_key_column
                 insert_cond = f"{uniq_column} IN (SELECT * FROM {insert_temp_table_name})"
 
-            columns = list(map(escape_column_id, get_columns_names_with_prop(table, "name")))
-            col_str = ", ".join(columns)
-            select_sql = f"SELECT {col_str} FROM {staging_table_name} WHERE {insert_cond}"
+            all_columns = list(map(escape_column_id, get_columns_names_with_prop(table, "name")))
+            # for root table, replace constant columns with literals in SELECT
+            if cc_escaped and not is_nested_table(table):
+                staging_columns = [c for c in all_columns if c not in cc_escaped]
+                select_exprs = [
+                    cc_escaped[c] if c in cc_escaped else c for c in all_columns
+                ]
+            else:
+                staging_columns = all_columns
+                select_exprs = all_columns
+
+            col_str = ", ".join(all_columns)
+            select_expr_str = ", ".join(select_exprs)
+            select_sql = (
+                f"SELECT {select_expr_str} FROM {staging_table_name} WHERE {insert_cond}"
+            )
             if len(primary_keys) > 0 and len(table_chain) == 1:
                 # without nested tables we deduplicate inside the query instead of using a temp table
-                select_sql = cls.gen_select_from_dedup_sql(
+                dedup_sql = cls.gen_select_from_dedup_sql(
                     staging_table_name,
                     primary_keys,
-                    columns,
+                    staging_columns,
                     dedup_sort,
                     insert_cond,
                     skip_dedup=skip_dedup,
                 )
+                if cc_escaped and not is_nested_table(table):
+                    # wrap dedup query, replacing constant columns with literals
+                    # in correct positional order matching the INSERT column list
+                    wrapper_exprs = [
+                        cc_escaped[c] if c in cc_escaped else f"_dlt_src.{c}"
+                        for c in all_columns
+                    ]
+                    select_sql = (
+                        f"SELECT {', '.join(wrapper_exprs)}"
+                        f" FROM ({dedup_sql}) AS _dlt_src"
+                    )
+                else:
+                    select_sql = dedup_sql
 
             sql.append(f"INSERT INTO {table_name}({col_str}) {select_sql}")
         return sql
@@ -737,15 +775,25 @@ class SqlMergeFollowupJob(SqlFollowupJob):
         deleted_cond: Optional[str],
         insert_only: bool = False,
         not_deleted_cond: Optional[str] = None,
+        cc_escaped: Optional[Dict[str, str]] = None,
     ) -> List[str]:
         """Generate MERGE statement for upsert/insert-only on root table.
 
         Override for backends that don't support DELETE in MERGE (e.g., DuckLake).
         When `insert_only`, uses `not_deleted_cond` to pre-filter staging.
+
+        Constant columns (`cc_escaped`) are injected as literal VALUES in the
+        INSERT clause and are excluded from the UPDATE SET clause — their value
+        in the destination is never overwritten by a merge.
         """
         sql: List[str] = []
         on_str = " AND ".join([f"d.{c} = s.{c}" for c in primary_keys])
         col_str = ", ".join(["{alias}" + c for c in root_table_column_names])
+        # for constant columns, replace s.{col} with literal in VALUES
+        values_str = ", ".join(
+            cc_escaped[c] if cc_escaped and c in cc_escaped else "s." + c
+            for c in root_table_column_names
+        )
 
         if insert_only:
             staging_source = staging_root_table_name
@@ -757,10 +805,14 @@ class SqlMergeFollowupJob(SqlFollowupJob):
                 MERGE INTO {root_table_name} d USING {staging_source} s
                 ON {on_str}
                 WHEN NOT MATCHED
-                    THEN INSERT ({col_str.format(alias="")}) VALUES ({col_str.format(alias="s.")});
+                    THEN INSERT ({col_str.format(alias="")}) VALUES ({values_str});
             """)
         else:
-            update_str = ", ".join([c + " = " + "s." + c for c in root_table_column_names])
+            # constant columns should not be updated (they're constant)
+            update_cols = [
+                c for c in root_table_column_names if not (cc_escaped and c in cc_escaped)
+            ]
+            update_str = ", ".join([c + " = " + "s." + c for c in update_cols])
             delete_str = (
                 "" if hard_delete_col is None else f"WHEN MATCHED AND s.{deleted_cond} THEN DELETE"
             )
@@ -771,7 +823,7 @@ class SqlMergeFollowupJob(SqlFollowupJob):
                 WHEN MATCHED
                     THEN UPDATE SET {update_str}
                 WHEN NOT MATCHED
-                    THEN INSERT ({col_str.format(alias="")}) VALUES ({col_str.format(alias="s.")});
+                    THEN INSERT ({col_str.format(alias="")}) VALUES ({values_str});
             """)
         return sql
 
@@ -786,6 +838,7 @@ class SqlMergeFollowupJob(SqlFollowupJob):
         deleted_cond: Optional[str],
         row_filter: str,
         insert_only: bool = False,
+        cc_escaped: Optional[Dict[str, str]] = None,
     ) -> List[str]:
         """Generate DELETE + INSERT statements for upsert with row_filter.
 
@@ -819,13 +872,17 @@ class SqlMergeFollowupJob(SqlFollowupJob):
             )
         # insert staging rows (excluding hard-deleted) that don't match filtered partition
         col_str = ", ".join(root_table_column_names)
+        select_exprs = ", ".join(
+            cc_escaped[c] if cc_escaped and c in cc_escaped else f"s.{c}"
+            for c in root_table_column_names
+        )
         pk_match_ins = " AND ".join([f"d.{c} = s.{c}" for c in primary_keys])
         insert_filter = ""
         if hard_delete_col is not None:
             insert_filter = f" AND NOT (s.{deleted_cond})"
         sql.append(
             f"INSERT INTO {root_table_name} ({col_str})"
-            f" SELECT {', '.join(f's.{c}' for c in root_table_column_names)}"
+            f" SELECT {select_exprs}"
             f" FROM {staging_root_table_name} AS s"
             " WHERE NOT EXISTS ("
             f"SELECT 1 FROM {root_table_name} AS d"
@@ -863,6 +920,12 @@ class SqlMergeFollowupJob(SqlFollowupJob):
 
         row_filter = cls._get_row_filter(root_table)
 
+        # build constant column map: escaped col name -> escaped literal value
+        cc_escaped: Dict[str, str] = {}
+        constant_cols = cls._get_constant_columns(root_table)
+        if constant_cols:
+            cc_escaped = {escape_column_id(n): escape_lit(v) for n, v in constant_cols.items()}
+
         # generate merge statement for root table
         root_table_column_names = list(map(escape_column_id, root_table["columns"]))
         # we need not_deleted_cond to filter out hard deleted rows before insert
@@ -885,6 +948,7 @@ class SqlMergeFollowupJob(SqlFollowupJob):
                     deleted_cond,
                     row_filter,
                     insert_only=insert_only,
+                    cc_escaped=cc_escaped,
                 )
             )
         else:
@@ -898,6 +962,7 @@ class SqlMergeFollowupJob(SqlFollowupJob):
                     deleted_cond,
                     insert_only=insert_only,
                     not_deleted_cond=not_deleted_cond,
+                    cc_escaped=cc_escaped,
                 )
             )
 

@@ -673,6 +673,30 @@ class DltResourceHints:
         if "row_filter" in md_dict:
             dict_["x-row-filter"] = md_dict["row_filter"] or None
 
+        if "constant_columns" in md_dict:
+            cc = md_dict["constant_columns"]
+            if cc:
+                if not isinstance(cc, dict):
+                    raise ValueError(
+                        "constant_columns must be a dict mapping column names to literal"
+                        " values"
+                    )
+                for k, v in cc.items():
+                    if not isinstance(k, str) or not isinstance(v, str):
+                        raise ValueError(
+                            "constant_columns keys and values must be strings, got"
+                            f" {type(k).__name__}: {type(v).__name__} for entry"
+                            f" {k!r}: {v!r}"
+                        )
+                columns = dict_.get("columns", {})
+                missing = [k for k in cc if k not in columns]
+                if missing:
+                    raise ValueError(
+                        f"constant_columns reference columns not defined in the table"
+                        f" schema: {missing}. Add them via the `columns` hint first."
+                    )
+            dict_["x-constant-columns"] = cc or None
+
         if merge_strategy == "scd2":
             md_dict = cast(TScd2StrategyDict, md_dict)
             if "boundary_timestamp" in md_dict:
