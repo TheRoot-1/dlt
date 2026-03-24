@@ -850,7 +850,7 @@ WHERE """
 
     def _update_schema_in_storage(self, schema: Schema) -> None:
         # get schema string or zip
-        schema_str = json.dumps(schema.to_dict())
+        schema_str = json.dumps(schema.to_dict(remove_processing_hints=True))
         # TODO: not all databases store data as utf-8 but this exception is mostly for redshift
         schema_bytes = schema_str.encode("utf-8")
         if len(schema_bytes) > self.capabilities.max_text_data_type_length:

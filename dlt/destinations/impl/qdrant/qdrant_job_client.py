@@ -476,7 +476,7 @@ class QdrantClient(JobClientBase, WithStateSync):
             self.db_client = None
 
     def _update_schema_in_storage(self, schema: Schema) -> None:
-        schema_str = json.dumps(schema.to_dict())
+        schema_str = json.dumps(schema.to_dict(remove_processing_hints=True))
         values = [
             schema.version,
             schema.ENGINE_VERSION,

@@ -439,7 +439,7 @@ class LanceDBClient(JobClientBase, WithStateSync, WithSqlClient):
                     "version_hash"
                 ): self.schema.stored_version_hash,
                 self.schema.naming.normalize_identifier("schema"): json.dumps(
-                    self.schema.to_dict()
+                    self.schema.to_dict(remove_processing_hints=True)
                 ),
             }
         ]

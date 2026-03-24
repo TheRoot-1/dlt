@@ -1192,7 +1192,7 @@ class FilesystemClient(
             "version": schema.version,
             "engine_version": schema.ENGINE_VERSION,
             "inserted_at": pendulum.now(),
-            "schema": json.dumps(schema.to_dict()),
+            "schema": json.dumps(schema.to_dict(remove_processing_hints=True)),
         }
 
         # we always keep tabs on what the current schema is

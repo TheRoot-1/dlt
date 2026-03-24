@@ -261,7 +261,7 @@ class SqlalchemyJobClient(SqlJobClientWithStagingDataset):
     def _update_schema_in_storage(self, schema: Schema) -> None:
         version_table = schema.tables[schema.version_table_name]
         table_obj = self._to_table_object(version_table)  # type: ignore[arg-type]
-        schema_str = json.dumps(schema.to_dict())
+        schema_str = json.dumps(schema.to_dict(remove_processing_hints=True))
 
         schema_mapping = StorageSchemaInfo(
             version=schema.version,

@@ -972,6 +972,42 @@ def test_merge_table_x_hints_preserved_when_not_in_partial() -> None:
     assert table["x-bigquery-table-description"] == "my description"  # type: ignore[typeddict-item]
 
 
+def test_remove_processing_hints_strips_transient_merge_hints() -> None:
+    tables = {
+        "t": {
+            "name": "t",
+            "columns": {},
+            "x-normalizer": {"evolve-columns-p-k-globally": True},
+            "x-row-filter": "partition_key = '2024-01-01'",
+            "x-constant-columns": {"partition_key": "'2024-01-01'"},
+            "x-boundary-timestamp": "2024-01-01T00:00:00Z",
+        }
+    }
+    result = utils.remove_processing_hints(tables)
+    assert "x-normalizer" not in result["t"]
+    assert "x-row-filter" not in result["t"]
+    assert "x-constant-columns" not in result["t"]
+    assert "x-boundary-timestamp" not in result["t"]
+
+
+def test_remove_processing_hints_preserves_structural_x_hints() -> None:
+    tables = {
+        "t": {
+            "name": "t",
+            "columns": {},
+            "x-merge-strategy": "delete-insert",
+            "x-row-filter": "partition_key = '2024-01-01'",
+            "x-constant-columns": {"partition_key": "'2024-01-01'"},
+        }
+    }
+    result = utils.remove_processing_hints(tables)
+    # structural hints are preserved
+    assert result["t"]["x-merge-strategy"] == "delete-insert"  # type: ignore[typeddict-item]
+    # transient hints are removed
+    assert "x-row-filter" not in result["t"]
+    assert "x-constant-columns" not in result["t"]
+
+
 # def add_column_defaults(column: TColumnSchemaBase) -> TColumnSchema:
 #     """Adds default boolean hints to column"""
 #     return {

@@ -242,6 +242,9 @@ TTableProcessingHints = TypedDict(
         "x-normalizer": Optional[Dict[str, Any]],
         "x-loader": Optional[Dict[str, Any]],
         "x-extractor": Optional[Dict[str, Any]],
+        "x-row-filter": Optional[str],
+        "x-constant-columns": Optional[Dict[str, str]],
+        "x-boundary-timestamp": Optional[str],
     },
     total=False,
 )
